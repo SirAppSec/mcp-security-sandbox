@@ -9,6 +9,7 @@ dependencies = [
     "html2text>=2024.2.26",
     "mcp[cli]>=1.6.0",
     "ollama>=0.4.7",
+    "pydantic-ai>=0.0.55",
     "requests>=2.32.3",
     "streamlit>=1.44.1",
     "torch>=2.6.0",

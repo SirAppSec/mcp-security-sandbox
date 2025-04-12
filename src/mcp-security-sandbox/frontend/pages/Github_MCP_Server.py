@@ -26,7 +26,7 @@ def main():
     st.title("Github repo summerize")
     st.write("Use MCP Server URL, and a github repository to summerize a repo")
 
-    github_url = st.text_input("GitHub Repo URL", "https://github.com/jlowin/fastmcp")
+    github_url = st.text_input("GitHub Repo URL", "https://github.com/SirAppSec/mcp-security-sandbox")
     server_url = st.text_input("MCP Server URL", "http://localhost:5010/sse")
 
     if st.button("fetch readme summery"):

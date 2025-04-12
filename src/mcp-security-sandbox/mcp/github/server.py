@@ -27,7 +27,7 @@ mcp = FastMCP("github-summary")
 @mcp.tool()
 def describe_github_repo(url: str) -> str:
     """
-    summarizes a github repository
+    provide the description of a github repository
     """
     try:
         # input validation
