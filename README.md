@@ -9,8 +9,10 @@ This repository defines an MCP server(github retrieval), and integrate it into a
 
 
 #### Burp Suite MCP Server
-use to chain and interact with multiple MCP servers, in this example, we've enabled intercept and performed a revtrieval using the github tool to describe this repository!
+Use to chain and interact with multiple MCP servers, in this example, we've enabled intercept and performed a revtrieval using the github tool to describe this repository!
+
 ![image](https://github.com/user-attachments/assets/c3369724-6520-4f7b-8257-2df28ae76f9f)
+note: [install Burps MCP Server first](https://github.com/PortSwigger/mcp-server?tab=readme-ov-file#manual-installations)
 
 
 # Quick Start
