@@ -11,10 +11,11 @@ from urllib.parse import urlparse, parse_qs
 import logging
 from typing import Dict, List, Optional, Any
 import traceback
+import re
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("jsonrpc-sse")
+logger = logging.getLogger("jsonrpc-sse-mcp")
 
 class JsonRPCMessage:
     def __init__(self, raw_data: str):
@@ -73,19 +74,21 @@ class JsonRPCMessage:
             return f"Invalid JsonRPC message"
 
 
-class SSEJsonRPCInterceptor:
+class MCPSSEInterceptor:
     def __init__(self):
         self.intercepted_messages = []
         self.is_intercepting = True
         self.proxy_port = 8844
         self.proxy_url = f"http://localhost:{self.proxy_port}"
-        self.target_url = None
+        self.target_base_url = None
+        self.sse_endpoint = None
+        self.message_endpoint = None
         self.custom_headers = {}
         self.running = False
         self.proxy_thread = None
         self.allow_message_modification = False
-        self.message_queue = asyncio.Queue()
         self.modified_messages = {}  # Store modified messages by ID
+        self.client_sessions = {}  # Track client connections by session ID
     
     def start_proxy(self, target_url: str, headers: Optional[Dict] = None) -> str:
         """Start the proxy server in a separate thread"""
@@ -93,7 +96,27 @@ class SSEJsonRPCInterceptor:
             self.stop_proxy()
             time.sleep(1)  # Allow time for cleanup
         
-        self.target_url = target_url
+        # Parse the target URL to extract the base URL and endpoints
+        parsed_url = urlparse(target_url)
+        path = parsed_url.path.rstrip('/')
+        
+        # If the path ends with /sse, use that as the SSE endpoint and assume /messages/ for POST
+        if path.endswith('/sse'):
+            self.sse_endpoint = '/sse'
+            self.message_endpoint = '/messages/'
+        else:
+            # Otherwise, use the provided path directly and guess message endpoint
+            self.sse_endpoint = path
+            # For MCP servers, messages are typically posted to a /messages/ endpoint
+            self.message_endpoint = '/messages/'
+        
+        # Set the base URL (scheme + netloc)
+        self.target_base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        
+        logger.info(f"Base URL: {self.target_base_url}")
+        logger.info(f"SSE Endpoint: {self.sse_endpoint}")
+        logger.info(f"Message Endpoint: {self.message_endpoint}")
+        
         self.custom_headers = headers or {}
         self.running = True
         self.intercepted_messages = []
@@ -113,7 +136,11 @@ class SSEJsonRPCInterceptor:
         
         async def start_site():
             app = web.Application()
-            app.router.add_get('/{tail:.*}', self.handle_sse)
+            # Route for the SSE endpoint
+            app.router.add_get(self.sse_endpoint, self.handle_sse)
+            # Route for message posting (assuming it's a POST endpoint)
+            app.router.add_post(self.message_endpoint + '{tail:.*}', self.handle_post_message)
+            app.router.add_get(self.message_endpoint + '{tail:.*}', self.handle_get_message)
             
             runner = web.AppRunner(app)
             await runner.setup()
@@ -121,6 +148,8 @@ class SSEJsonRPCInterceptor:
             await site.start()
             
             logger.info(f"Proxy started at {self.proxy_url}")
+            logger.info(f"SSE endpoint: {self.proxy_url}{self.sse_endpoint}")
+            logger.info(f"Message endpoint: {self.proxy_url}{self.message_endpoint}")
             
             while self.running:
                 await asyncio.sleep(1)
@@ -139,6 +168,16 @@ class SSEJsonRPCInterceptor:
         """Handle incoming SSE connections"""
         logger.info(f"New SSE connection: {request.path}?{request.query_string}")
         
+        # Extract session ID if present
+        session_id = None
+        if request.query_string:
+            params = parse_qs(request.query_string)
+            session_id = params.get('session_id', [None])[0]
+        
+        if session_id:
+            logger.info(f"Session ID: {session_id}")
+            self.client_sessions[session_id] = time.time()
+        
         response = web.StreamResponse(
             status=200,
             reason='OK',
@@ -151,24 +190,12 @@ class SSEJsonRPCInterceptor:
         )
         await response.prepare(request)
         
-        # Get path and query string from request
-        path = request.path
-        query_params = request.query_string
+        # Build the target URL for SSE
+        target_sse_url = f"{self.target_base_url}{self.sse_endpoint}"
+        if request.query_string:
+            target_sse_url += f"?{request.query_string}"
         
-        # Build the target URL
-        parsed_target = urlparse(self.target_url)
-        target_base = f"{parsed_target.scheme}://{parsed_target.netloc}"
-        
-        if path.startswith('/'):
-            target_path = path
-        else:
-            target_path = f"/{path}"
-            
-        full_target_url = f"{target_base}{target_path}"
-        if query_params:
-            full_target_url += f"?{query_params}"
-        
-        logger.info(f"Connecting to target: {full_target_url}")
+        logger.info(f"Connecting to target SSE: {target_sse_url}")
         
         # Set up headers for the target request
         headers = {**self.custom_headers}
@@ -176,45 +203,21 @@ class SSEJsonRPCInterceptor:
             if header.lower() not in ['host', 'connection']:
                 headers[header] = value
         
-        # Function to process SSE data line
-        def process_sse_line(line: str) -> str:
-            """Process an SSE line and intercept JsonRPC messages"""
-            if not line.startswith('data:'):
-                return line
-            
-            # Extract the JSON data
-            json_data = line[5:].strip()
-            if not json_data:
-                return line
-                
-            # Create JsonRPC message object
-            message = JsonRPCMessage(json_data)
-            
-            # Store for UI display if interception is on
-            if self.is_intercepting:
-                self.intercepted_messages.append(message.to_dict())
-                
-            # Check if this message has been modified
-            if self.allow_message_modification and message.id in self.modified_messages:
-                logger.info(f"Using modified message for id={message.id}")
-                modified_data = self.modified_messages.pop(message.id)
-                return f"data: {modified_data}\n\n"
-                
-            return line
+        # Track original and modified events
+        buffer = ""
         
-        # Create a task for handling the SSE connection
         async def sse_client():
+            nonlocal buffer
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(full_target_url, headers=headers) as resp:
+                    async with session.get(target_sse_url, headers=headers) as resp:
                         if resp.status != 200:
                             error_msg = f"Target returned error: {resp.status} {resp.reason}"
                             logger.error(error_msg)
                             await response.write(f"data: {error_msg}\n\n".encode('utf-8'))
                             return
                             
-                        logger.info(f"Connected to target, streaming events...")
-                        buffer = ""
+                        logger.info(f"Connected to target SSE, streaming events...")
                         
                         async for line_bytes in resp.content:
                             if not self.running:
@@ -223,19 +226,62 @@ class SSEJsonRPCInterceptor:
                             line = line_bytes.decode('utf-8')
                             buffer += line
                             
-                            # Process complete lines
-                            if '\n\n' in buffer:
-                                lines = buffer.split('\n\n')
-                                # Keep the last incomplete chunk
-                                buffer = lines.pop(-1)
+                            # Process complete SSE events (data: ... followed by \n\n)
+                            if buffer.endswith('\n\n'):
+                                events = re.findall(r'data: (.*?)\n\n', buffer, re.DOTALL)
+                                buffer = ""
                                 
-                                for complete_line in lines:
-                                    if complete_line.strip():
-                                        processed_line = process_sse_line(complete_line + '\n\n')
-                                        await response.write(processed_line.encode('utf-8'))
+                                for event_data in events:
+                                    # Check if it's a JsonRPC message
+                                    try:
+                                        # Create the message object
+                                        message = JsonRPCMessage(event_data)
+                                        
+                                        # Store for UI display if interception is on
+                                        if self.is_intercepting:
+                                            self.intercepted_messages.append(message.to_dict())
+                                        
+                                        # Check if this message has been modified
+                                        if (self.allow_message_modification and 
+                                            message.id in self.modified_messages):
+                                            modified_data = self.modified_messages.pop(message.id)
+                                            await response.write(f"data: {modified_data}\n\n".encode('utf-8'))
+                                        else:
+                                            await response.write(f"data: {event_data}\n\n".encode('utf-8'))
+                                    except Exception as e:
+                                        # Not a valid JsonRPC or other error, just pass through
+                                        logger.warning(f"Error processing event: {str(e)}")
+                                        await response.write(f"data: {event_data}\n\n".encode('utf-8'))
+                                        
+                                    await response.drain()
+                            elif '\n\n' in buffer:
+                                # Process multi-part buffer
+                                parts = buffer.split('\n\n')
+                                last_part = parts.pop()  # Keep the incomplete part
+                                
+                                for part in parts:
+                                    if part.startswith('data: '):
+                                        event_data = part[6:]
+                                        try:
+                                            message = JsonRPCMessage(event_data)
+                                            
+                                            if self.is_intercepting:
+                                                self.intercepted_messages.append(message.to_dict())
+                                                
+                                            if (self.allow_message_modification and 
+                                                message.id in self.modified_messages):
+                                                modified_data = self.modified_messages.pop(message.id)
+                                                await response.write(f"data: {modified_data}\n\n".encode('utf-8'))
+                                            else:
+                                                await response.write(f"data: {event_data}\n\n".encode('utf-8'))
+                                        except Exception as e:
+                                            await response.write(f"data: {event_data}\n\n".encode('utf-8'))
+                                            
                                         await response.drain()
+                                        
+                                buffer = last_part
             except Exception as e:
-                error_msg = f"Error: {str(e)}"
+                error_msg = f"Error in SSE client: {str(e)}"
                 logger.error(error_msg)
                 await response.write(f"data: {error_msg}\n\n".encode('utf-8'))
         
@@ -247,6 +293,115 @@ class SSEJsonRPCInterceptor:
             traceback.print_exc()
             
         return response
+    
+    async def handle_post_message(self, request: web.Request) -> web.Response:
+        """Handle POST requests to the message endpoint"""
+        logger.info(f"Message POST: {request.path}?{request.query_string}")
+        
+        # Build the target message URL
+        tail = request.match_info.get('tail', '')
+        target_url = f"{self.target_base_url}{self.message_endpoint}{tail}"
+        if request.query_string:
+            target_url += f"?{request.query_string}"
+            
+        logger.info(f"Forwarding message to: {target_url}")
+        
+        # Get request body
+        try:
+            body = await request.read()
+            
+            # Set up headers
+            headers = {**self.custom_headers}
+            for header, value in request.headers.items():
+                if header.lower() not in ['host', 'connection']:
+                    headers[header] = value
+            
+            # Log the message if it's JSON
+            try:
+                if body:
+                    body_str = body.decode('utf-8')
+                    # Try to parse as JSON
+                    message = JsonRPCMessage(body_str)
+                    
+                    # Store for UI display if interception is on
+                    if self.is_intercepting:
+                        self.intercepted_messages.append(message.to_dict())
+                        
+                    # Check if this message should be modified
+                    if (self.allow_message_modification and 
+                        message.id in self.modified_messages):
+                        logger.info(f"Using modified message for id={message.id}")
+                        modified_data = self.modified_messages.pop(message.id)
+                        body = modified_data.encode('utf-8')
+            except Exception as e:
+                logger.warning(f"Error handling request body: {str(e)}")
+            
+            # Forward the request
+            async with aiohttp.ClientSession() as session:
+                async with session.post(target_url, data=body, headers=headers) as resp:
+                    response_data = await resp.read()
+                    
+                    # Create response with same status and headers
+                    response = web.Response(
+                        status=resp.status,
+                        body=response_data
+                    )
+                    
+                    # Copy headers from the target response
+                    for header, value in resp.headers.items():
+                        if header.lower() not in ['content-length', 'transfer-encoding']:
+                            response.headers[header] = value
+                            
+                    return response
+        except Exception as e:
+            logger.error(f"Error handling POST message: {str(e)}")
+            return web.Response(
+                status=500,
+                text=f"Error proxying request: {str(e)}"
+            )
+    
+    async def handle_get_message(self, request: web.Request) -> web.Response:
+        """Handle GET requests to the message endpoint"""
+        logger.info(f"Message GET: {request.path}?{request.query_string}")
+        
+        # Build the target message URL
+        tail = request.match_info.get('tail', '')
+        target_url = f"{self.target_base_url}{self.message_endpoint}{tail}"
+        if request.query_string:
+            target_url += f"?{request.query_string}"
+            
+        logger.info(f"Forwarding GET to: {target_url}")
+        
+        # Set up headers
+        headers = {**self.custom_headers}
+        for header, value in request.headers.items():
+            if header.lower() not in ['host', 'connection']:
+                headers[header] = value
+        
+        # Forward the request
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(target_url, headers=headers) as resp:
+                    response_data = await resp.read()
+                    
+                    # Create response with same status and headers
+                    response = web.Response(
+                        status=resp.status,
+                        body=response_data
+                    )
+                    
+                    # Copy headers from the target response
+                    for header, value in resp.headers.items():
+                        if header.lower() not in ['content-length', 'transfer-encoding']:
+                            response.headers[header] = value
+                            
+                    return response
+        except Exception as e:
+            logger.error(f"Error handling GET message: {str(e)}")
+            return web.Response(
+                status=500,
+                text=f"Error proxying request: {str(e)}"
+            )
     
     def stop_proxy(self):
         """Stop the proxy server"""
@@ -280,30 +435,55 @@ class SSEJsonRPCInterceptor:
         """Store a modified message to be used instead of the original"""
         self.modified_messages[message_id] = modified_data
         logger.info(f"Stored modified message for id={message_id}")
+    
+    def send_custom_message(self, message_data: str, session_id: Optional[str] = None) -> (bool, str):
+        """Send a custom message to the target endpoint"""
+        if not self.target_base_url or not self.message_endpoint:
+            return False, "Proxy not started"
+            
+        target_url = f"{self.target_base_url}{self.message_endpoint}"
+        if session_id:
+            if '?' in target_url:
+                target_url += f"&session_id={session_id}"
+            else:
+                target_url += f"?session_id={session_id}"
+                
+        headers = {
+            "Content-Type": "application/json",
+            **self.custom_headers
+        }
+        
+        try:
+            response = requests.post(target_url, data=message_data, headers=headers)
+            return True, f"Message sent with status code: {response.status_code}"
+        except Exception as e:
+            return False, f"Error sending message: {str(e)}"
 
 
 # Streamlit app
 st.set_page_config(
-    page_title="JsonRPC over SSE Interceptor",
+    page_title="MCP JsonRPC over SSE Interceptor",
     page_icon="🔍",
     layout="wide"
 )
 
-st.title("JsonRPC over SSE Interceptor")
+st.title("MCP JsonRPC over SSE Interceptor")
 
 # Initialize the interceptor
 if 'interceptor' not in st.session_state:
-    st.session_state.interceptor = SSEJsonRPCInterceptor()
+    st.session_state.interceptor = MCPSSEInterceptor()
     st.session_state.message_filter = ""
     st.session_state.show_requests = True
     st.session_state.show_responses = True
     st.session_state.show_invalid = False
+    st.session_state.auto_refresh = True
+    st.session_state.last_refresh = time.time()
 
 # URL input form
 with st.form("url_form"):
     col1, col2 = st.columns([3, 1])
     with col1:
-        url = st.text_input("Target SSE URL", value="https://example.com/messages")
+        url = st.text_input("Target SSE URL", value="http://localhost:5010/sse")
     with col2:
         interception = st.checkbox("Enable Interception", value=True)
     
@@ -312,7 +492,6 @@ with st.form("url_form"):
         headers_text = st.text_area(
             "Enter headers in JSON format",
             value=json.dumps({
-                "Authorization": "Bearer YOUR_TOKEN_HERE",
                 "Content-Type": "text/event-stream",
                 "Accept": "text/event-stream"
             }, indent=2)
@@ -334,7 +513,7 @@ with st.form("url_form"):
         st.session_state.interceptor.toggle_interception(interception)
         
         if proxy_url:
-            st.success(f"Proxy started at: {proxy_url}")
+            st.success(f"Proxy started at: {proxy_url}{st.session_state.interceptor.sse_endpoint}")
             st.info("Use this URL in your client application instead of the original URL")
         else:
             st.error("Failed to start proxy server")
@@ -343,7 +522,7 @@ with st.form("url_form"):
 st.subheader("Control Panel")
 
 # Control buttons
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 with col1:
     if st.button("Toggle Interception"):
         current_state = st.session_state.interceptor.is_intercepting
@@ -365,6 +544,9 @@ with col4:
     if st.button("Stop Proxy"):
         st.session_state.interceptor.stop_proxy()
         st.success("Proxy stopped")
+
+with col5:
+    st.session_state.auto_refresh = st.checkbox("Auto Refresh", value=st.session_state.auto_refresh)
 
 # Filter settings
 st.subheader("Message Filters")
@@ -394,12 +576,36 @@ with col4:
         value=st.session_state.show_invalid
     )
 
+# Handle auto-refresh
+if st.session_state.auto_refresh and time.time() - st.session_state.last_refresh > 2:
+    st.session_state.last_refresh = time.time()
+    st.rerun()
+
 # Display intercepted messages
 st.subheader("Intercepted JsonRPC Messages")
 messages = st.session_state.interceptor.get_messages()
 
 if not messages:
     st.info("No JsonRPC messages intercepted yet. Make sure the proxy is running and client is connected.")
+    
+    # Hint for connecting
+    st.info(f"""
+    Connect your client to: {st.session_state.interceptor.proxy_url}{st.session_state.interceptor.sse_endpoint}
+    
+    If you're using a Python client, here's example code to connect:
+    ```python
+    # Create SSE client connected to proxy
+    from sseclient import SSEClient
+    
+    # Use this URL for your SSE client
+    url = "{st.session_state.interceptor.proxy_url}{st.session_state.interceptor.sse_endpoint}"
+    client = SSEClient(url)
+    
+    # Process messages
+    for event in client.events():
+        print(f"Received event: "+event.data)
+    ```
+    """)
 else:
     # Apply filters
     filtered_messages = []
@@ -505,67 +711,66 @@ with st.form("custom_message_form"):
         }
     }, indent=2)
     
-    custom_message = st.text_area("Custom JsonRPC message (JSON format):", value=default_request, height=200)
-    custom_url = st.text_input("Custom target URL (optional, leave empty to use the original URL)")
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        custom_message = st.text_area("Custom JsonRPC message (JSON format):", value=default_request, height=200)
+    with col2:
+        session_id = st.text_input("Session ID (optional)", value="", help="If provided, will add session_id parameter to the URL")
     
     if st.form_submit_button("Send Custom Message"):
         try:
             # Validate the JSON
-            json_data = json.loads(custom_message)
+            json.loads(custom_message)
             
-            target = custom_url if custom_url else st.session_state.interceptor.target_url
-            if not target:
-                st.error("No target URL specified")
+            # Send the message
+            success, message = st.session_state.interceptor.send_custom_message(
+                custom_message, 
+                session_id if session_id else None
+            )
+            
+            if success:
+                st.success(message)
             else:
-                # Prepare headers
-                headers = {
-                    "Content-Type": "application/json",
-                    **st.session_state.interceptor.custom_headers
-                }
-                
-                # Send the request
-                try:
-                    response = requests.post(target, data=custom_message, headers=headers)
-                    st.success(f"Message sent with status code: {response.status_code}")
-                    
-                    if response.text:
-                        st.text("Response:")
-                        try:
-                            st.json(response.json())
-                        except:
-                            st.code(response.text)
-                except Exception as e:
-                    st.error(f"Error sending message: {str(e)}")
+                st.error(message)
         except json.JSONDecodeError as e:
             st.error(f"Invalid JSON: {str(e)}")
 
+# Connection details
+st.subheader("Connection Details")
+st.info(f"""
+**Proxy URL:** {st.session_state.interceptor.proxy_url}
+**SSE Endpoint:** {st.session_state.interceptor.sse_endpoint}
+**Message Endpoint:** {st.session_state.interceptor.message_endpoint}
+
+For your client, use: {st.session_state.interceptor.proxy_url}{st.session_state.interceptor.sse_endpoint}
+""")
+
 # Help section
-with st.expander("How to use this interceptor"):
+with st.expander("Troubleshooting"):
     st.markdown("""
-    ### Instructions:
+    ### Common Issues:
     
-    1. **Enter the target SSE URL** - The endpoint your client normally connects to for SSE events
-    2. **Add necessary headers** - Such as authorization tokens or content types
-    3. **Start the proxy** - This creates a local server that intercepts and forwards traffic
-    4. **Configure your client** to use the proxy URL instead of the original URL
-    5. **Watch JsonRPC messages** being intercepted in real-time
-    6. **Modify messages** by editing them and storing for future use
+    1. **No messages are intercepted:**
+       - Make sure your client is connecting to the proxy URL, not the original server
+       - Check that the SSE endpoint path is correct
+       - Ensure any required session IDs or authentication are provided
+       
+    2. **Connection errors:**
+       - Verify the original server is running and accessible
+       - Check if custom headers are needed for authentication
+       - Try restarting both the proxy and the client
+       
+    3. **Message parsing errors:**
+       - If messages aren't showing up as JsonRPC, check the "Show Invalid" option
+       - Some initial handshaking messages might not be in JsonRPC format
+       
+    ### Debug Tips:
     
-    ### Features:
-    
-    - Intercept and display JsonRPC messages sent over SSE
-    - Filter messages by type (requests/responses) and content
-    - Modify messages on the fly before they reach your client
-    - Send custom JsonRPC messages directly to the server
-    
-    ### Troubleshooting:
-    
-    - If connections fail, check that your target URL is correct and accessible
-    - Make sure all required headers are included
-    - For secure (HTTPS) targets, your client may need to accept self-signed certificates
-    - If no messages appear, ensure your client is connecting through the proxy URL
+    1. Use the session ID field when sending custom messages if your server requires it
+    2. Enable "Show Invalid" to see all intercepted data, even if it's not valid JsonRPC
+    3. Check your client's console for connection errors
+    4. Try sending a basic message to test connectivity
     """)
 
-# Footer
 st.markdown("---")
-st.caption("JsonRPC over SSE Interceptor - View and modify JsonRPC messages sent over Server-Sent Events")
+st.caption("MCP JsonRPC over SSE Interceptor - Analyze")
