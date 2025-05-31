@@ -5,12 +5,18 @@ description = "An experimental sandbox and a lab to explore mcp hosts, mcp clien
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "aiohttp>=3.11.16",
     "bs4>=0.0.2",
+    "fastapi>=0.115.12",
+    "flask>=3.1.0",
     "html2text>=2024.2.26",
+    "httpx>=0.28.1",
     "mcp[cli]>=1.6.0",
+    "nest-asyncio>=1.6.0",
     "ollama>=0.4.7",
     "pydantic-ai>=0.0.55",
     "requests>=2.32.3",
+    "sseclient-py>=1.8.0",
     "streamlit>=1.44.1",
     "torch>=2.6.0",
 ]
